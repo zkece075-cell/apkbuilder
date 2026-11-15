@@ -1,0 +1,115 @@
+name: APK Release Worker
+
+on:
+  push:
+    branches: [ "main", "master", "builder-worker" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  primary-worker:
+    name: Worker 1 - Primary Release Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+      - uses: subosito/flutter-action@v2
+        if: hashFiles('pubspec.yaml') != ''
+        with:
+          channel: 'stable'
+          cache: true
+      - name: Bersihkan Path Lokal & Siapkan Keystore
+        run: |
+          rm -f local.properties android/local.properties
+          if [ ! -f "android/key.properties" ] && [ -d "android" ]; then
+            keytool -genkey -v -keystore android/app/auto-release.jks \
+              -storepass android123 -alias releasekey -keypass android123 \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=GitHubWorker, OU=Build, O=Android, L=ID, S=ID, C=ID"
+            printf "storePassword=android123\nkeyPassword=android123\nkeyAlias=releasekey\nstoreFile=auto-release.jks\n" > android/key.properties
+          fi
+      - name: Compile APK Release
+        run: |
+          mkdir -p release_out
+          if [ -f "pubspec.yaml" ]; then
+            [ ! -d "android" ] && flutter create . --platforms=android
+            flutter pub get
+            flutter build apk --release
+            APK_PATH=$(find build/app/outputs -name "*.apk" | head -n 1)
+          else
+            if [ -f "gradlew" ]; then
+              chmod +x gradlew
+              ./gradlew assembleRelease
+            else
+              gradle assembleRelease
+            fi
+            APK_PATH=$(find . -path "*/outputs/apk/*" -name "*.apk" | head -n 1)
+          fi
+          [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ] && exit 1
+          if [[ "$APK_PATH" == *"unsigned"* ]]; then
+            BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 | sort -V | tail -n 1)
+            "$BUILD_TOOLS/apksigner" sign --ks android/app/auto-release.jks \
+              --ks-pass pass:android123 --key-pass pass:android123 \
+              --out release_out/app-worker-release.apk "$APK_PATH"
+          else
+            cp "$APK_PATH" release_out/app-worker-release.apk
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: built-release-apk
+          path: release_out/app-worker-release.apk
+
+  fallback-worker:
+    name: Worker 2 - Fallback Recovery Build
+    needs: primary-worker
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        if: hashFiles('pubspec.yaml') != ''
+        with:
+          channel: 'stable'
+      - name: Deep Clean & Build Tanpa Shrinker
+        run: |
+          set -o pipefail
+          rm -f local.properties android/local.properties
+          mkdir -p release_out
+          touch build_error.log
+          if [ -f "pubspec.yaml" ]; then
+            flutter clean
+            [ ! -d "android" ] && flutter create . --platforms=android
+            flutter pub get
+            flutter build apk --release --no-shrink 2>&1 | tee build_error.log
+            APK_PATH=$(find build/app/outputs -name "*.apk" | head -n 1)
+          else
+            if [ -f "gradlew" ]; then
+              chmod +x gradlew
+              ./gradlew clean assembleRelease --stacktrace 2>&1 | tee build_error.log
+            else
+              gradle clean assembleRelease --stacktrace 2>&1 | tee build_error.log
+            fi
+            APK_PATH=$(find . -path "*/outputs/apk/*" -name "*.apk" | head -n 1)
+          fi
+          [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ] && exit 1
+          cp "$APK_PATH" release_out/app-worker-release.apk
+      - if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-release-apk
+          path: release_out/app-worker-release.apk
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostic-log
+          path: build_error.log
